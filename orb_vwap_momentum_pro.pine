@@ -1,0 +1,443 @@
+//@version=6
+strategy(
+    title             = "ORB + VWAP Momentum Pro v1.0 [Apex Ready]",
+    overlay           = true,
+    default_qty_type  = strategy.fixed,
+    default_qty_value = 1,
+    initial_capital   = 50000,
+    commission_type   = strategy.commission.cash_per_order,
+    commission_value  = 2.50,
+    slippage          = 2
+)
+
+// ============================================================
+// ── INPUTS
+// ============================================================
+
+grp0 = "🔴 NEWS FILTER"
+use_news = input.bool(true,  "News Filter aktiv",               group=grp0)
+news_buf = input.int(5,      "Minuten gesperrt vor/nach News",  group=grp0)
+n1_on    = input.bool(false, "News 1 aktiv",                    group=grp0)
+n1_h     = input.int(8,      "News 1 Stunde EST",               group=grp0)
+n1_m     = input.int(30,     "News 1 Minute",                   group=grp0)
+n2_on    = input.bool(false, "News 2 aktiv",                    group=grp0)
+n2_h     = input.int(10,     "News 2 Stunde EST",               group=grp0)
+n2_m     = input.int(0,      "News 2 Minute",                   group=grp0)
+n3_on    = input.bool(false, "News 3 aktiv",                    group=grp0)
+n3_h     = input.int(14,     "News 3 Stunde EST",               group=grp0)
+n3_m     = input.int(0,      "News 3 Minute",                   group=grp0)
+
+grp1 = "📊 ORB + VWAP SETUP"
+orb_minutes = input.int(30,    "Opening Range Minuten (ab 9:30)", group=grp1, minval=15, maxval=60, step=5)
+vol_mult    = input.float(1.3, "Volume Spike Multiplikator",      group=grp1, minval=1.0, step=0.1)
+vol_period  = input.int(20,    "Volume Durchschnitt Perioden",    group=grp1, minval=10)
+macd_fast   = input.int(12,    "MACD Fast Periode",               group=grp1, minval=5)
+macd_slow   = input.int(26,    "MACD Slow Periode",               group=grp1, minval=10)
+macd_sig    = input.int(9,     "MACD Signal Periode",             group=grp1, minval=3)
+orb_min_atr = input.float(0.5, "Min. ORB Breite (ATR x)",         group=grp1, minval=0.1, step=0.1)
+
+grp2 = "⏰ SESSION"
+session_start_h = input.int(10, "Trading Start Stunde EST", group=grp2, minval=9)
+session_start_m = input.int(0,  "Trading Start Minute EST", group=grp2)
+session_end_h   = input.int(15, "Trading End Stunde EST",   group=grp2, maxval=16)
+session_end_m   = input.int(30, "Trading End Minute EST",   group=grp2)
+skip_monday     = input.bool(false, "Montag überspringen",  group=grp2)
+
+grp3 = "⚡ RISK MANAGEMENT"
+risk_pct       = input.float(1.0, "Risiko pro Trade (%)",         group=grp3, minval=0.1, maxval=2.0, step=0.1)
+tp1_rr         = input.float(1.0, "TP1 Risk:Reward",              group=grp3, minval=0.5, step=0.25)
+tp2_rr         = input.float(2.5, "TP2 Risk:Reward",              group=grp3, minval=1.0, step=0.5)
+tp1_pct        = input.int(50,    "TP1 Teilausstieg (%)",         group=grp3, minval=25, maxval=75)
+use_breakeven  = input.bool(true, "Breakeven nach TP1",           group=grp3)
+max_trades_day = input.int(3,     "Max Trades pro Tag",           group=grp3, minval=1, maxval=5)
+use_eod_close  = input.bool(true, "Position bei EOD schließen",   group=grp3)
+
+grp4 = "🏦 APEX REGELN"
+apex_daily_loss = input.float(1500, "Apex Max Daily Loss ($)",     group=grp4)
+apex_max_dd     = input.float(2500, "Apex Max Overall DD ($)",     group=grp4)
+apex_max_qty    = input.int(3,      "Apex Max Kontrakte",          group=grp4, minval=1)
+point_value     = input.float(20.0, "Punkt-Wert ($) — NQ = 20",   group=grp4)
+
+grp5 = "🎨 DARSTELLUNG"
+show_orb       = input.bool(true, "ORB Levels anzeigen",          group=grp5)
+show_vwap      = input.bool(true, "VWAP anzeigen",                group=grp5)
+show_signals   = input.bool(true, "Entry Signale anzeigen",       group=grp5)
+show_dashboard = input.bool(true, "Dashboard anzeigen",           group=grp5)
+
+// ============================================================
+// ── FARBEN
+// ============================================================
+col_bull  = color.new(#00E676, 0)
+col_bear  = color.new(#FF1744, 0)
+col_vwap  = color.new(#2196F3, 0)
+col_orb_h = color.new(#FFD600, 0)
+col_orb_l = color.new(#FF6F00, 0)
+col_news  = color.new(#FF1744, 80)
+
+// ============================================================
+// ── ZEITHELFER
+// ============================================================
+est_hour()   => hour(time,   "America/New_York")
+est_minute() => minute(time, "America/New_York")
+est_mins()   => est_hour() * 60 + est_minute()
+
+session_start = session_start_h * 60 + session_start_m
+session_end   = session_end_h   * 60 + session_end_m
+eod_close_min = 15 * 60 + 45
+orb_start_min = 9  * 60 + 30
+orb_end_min   = orb_start_min + orb_minutes
+
+in_orb      = est_mins() >= orb_start_min and est_mins() < orb_end_min
+post_orb    = est_mins() >= orb_end_min
+in_session  = est_mins() >= session_start and est_mins() < session_end
+is_monday   = dayofweek == dayofweek.monday
+day_blocked = skip_monday and is_monday
+is_new_day  = dayofmonth != dayofmonth[1]
+
+// ============================================================
+// ── NEWS FILTER
+// ============================================================
+near_news(on, nh, nm) => on and math.abs(est_mins() - (nh * 60 + nm)) <= news_buf
+news_blocked = use_news and (near_news(n1_on, n1_h, n1_m) or near_news(n2_on, n2_h, n2_m) or near_news(n3_on, n3_h, n3_m))
+bgcolor(news_blocked ? col_news : na, title="News Sperrzone")
+
+// ============================================================
+// ── VWAP (täglich reset)
+// ============================================================
+var float cum_pv = 0.0
+var float cum_v  = 0.0
+
+if is_new_day
+    cum_pv := 0.0
+    cum_v  := 0.0
+
+tp_val = (high + low + close) / 3
+cum_pv := cum_pv + tp_val * volume
+cum_v  := cum_v  + volume
+vwap_v  = cum_v > 0 ? cum_pv / cum_v : close
+
+// ============================================================
+// ── OPENING RANGE (täglich reset)
+// ============================================================
+var float orb_high = na
+var float orb_low  = na
+var bool  orb_done = false
+
+if is_new_day
+    orb_high := na
+    orb_low  := na
+    orb_done := false
+
+if in_orb
+    orb_high := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low  := na(orb_low)  ? low  : math.min(orb_low, low)
+
+if not in_orb and not na(orb_high)
+    orb_done := true
+
+// ============================================================
+// ── INDIKATOREN
+// ============================================================
+atr_val = ta.atr(14)
+vol_avg = ta.sma(volume, vol_period)
+
+[macd_line, macd_sig_l, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+
+vol_spike  = volume >= vol_avg * vol_mult
+macd_bull  = macd_hist > 0 and macd_hist > macd_hist[1]
+macd_bear  = macd_hist < 0 and macd_hist < macd_hist[1]
+above_vwap = close > vwap_v
+below_vwap = close < vwap_v
+
+// ORB muss eine Mindestbreite haben (filtert "fake" ORBs an sehr ruhigen Tagen)
+orb_range = orb_done ? orb_high - orb_low : 0.0
+orb_valid = orb_done and orb_range >= atr_val * orb_min_atr
+
+// ============================================================
+// ── PLOTS
+// ============================================================
+plot(show_vwap ? vwap_v : na, "VWAP", color=col_vwap, linewidth=2)
+
+orb_h_plot = plot(show_orb and orb_valid ? orb_high : na, "ORB High", color=col_orb_h, linewidth=2, style=plot.style_line)
+orb_l_plot = plot(show_orb and orb_valid ? orb_low  : na, "ORB Low",  color=col_orb_l, linewidth=2, style=plot.style_line)
+fill(orb_h_plot, orb_l_plot, color=color.new(#FFD600, 93), title="ORB Zone")
+
+// ============================================================
+// ── TAGES TRACKING
+// ============================================================
+var int   trades_today     = 0
+var float day_start_equity = strategy.initial_capital
+
+if is_new_day
+    trades_today     := 0
+    day_start_equity := strategy.equity
+
+daily_pnl   = strategy.equity - day_start_equity
+overall_pnl = strategy.netprofit
+
+// ============================================================
+// ── ENTRY BEDINGUNGEN
+// ============================================================
+can_trade = trades_today < max_trades_day
+          and daily_pnl   > -apex_daily_loss
+          and overall_pnl > -apex_max_dd
+          and not news_blocked
+          and not day_blocked
+          and in_session
+          and post_orb
+          and orb_valid
+          and strategy.position_size == 0
+
+// ORB Breakout: Close über ORB High / unter ORB Low (Momentum-Bestätigung durch Close)
+long_break  = ta.crossover(close,  orb_high)
+short_break = ta.crossunder(close, orb_low)
+
+// LONG: Breakout + über VWAP + Bullish MACD + Volume Spike
+long_signal  = can_trade and long_break  and above_vwap and macd_bull and vol_spike
+
+// SHORT: Breakdown + unter VWAP + Bearish MACD + Volume Spike
+short_signal = can_trade and short_break and below_vwap and macd_bear and vol_spike
+
+// ============================================================
+// ── SL / TP BERECHNUNG
+// ============================================================
+// SL: 0.5 ATR hinter die ORB-Grenze (strukturelles Level + Puffer)
+long_sl_price  = orb_low  - atr_val * 0.5
+short_sl_price = orb_high + atr_val * 0.5
+
+long_sl_dist  = math.max(close - long_sl_price,  1.0)
+short_sl_dist = math.max(short_sl_price - close, 1.0)
+
+long_tp1_price  = close + long_sl_dist  * tp1_rr
+long_tp2_price  = close + long_sl_dist  * tp2_rr
+short_tp1_price = close - short_sl_dist * tp1_rr
+short_tp2_price = close - short_sl_dist * tp2_rr
+
+// Dynamische Positionsgröße: exakt X% Equity riskieren
+risk_dollar    = strategy.equity * risk_pct / 100
+long_qty_calc  = math.floor(risk_dollar / (long_sl_dist  * point_value))
+short_qty_calc = math.floor(risk_dollar / (short_sl_dist * point_value))
+
+long_qty  = int(math.min(math.max(long_qty_calc,  1), apex_max_qty))
+short_qty = int(math.min(math.max(short_qty_calc, 1), apex_max_qty))
+
+// ============================================================
+// ── EXIT STATE TRACKING
+// ============================================================
+var float saved_sl_long    = na
+var float saved_sl_short   = na
+var float saved_tp1_long   = na
+var float saved_tp1_short  = na
+var float saved_tp2_long   = na
+var float saved_tp2_short  = na
+var bool  tp1_hit_long     = false
+var bool  tp1_hit_short    = false
+
+// ============================================================
+// ── SIGNAL SHAPES
+// ============================================================
+plotshape(show_signals and long_signal,  "Long Signal",  shape.triangleup,   location.belowbar, col_bull, size=size.normal)
+plotshape(show_signals and short_signal, "Short Signal", shape.triangledown, location.abovebar, col_bear, size=size.normal)
+
+// ============================================================
+// ── ORDER AUSFÜHRUNG
+// ============================================================
+if long_signal
+    q_tp1 = int(math.max(math.round(long_qty * tp1_pct / 100), 1))
+    q_tp2 = int(math.max(long_qty - q_tp1, 0))
+
+    saved_sl_long   := long_sl_price
+    saved_tp1_long  := long_tp1_price
+    saved_tp2_long  := long_tp2_price
+    tp1_hit_long    := false
+    tp1_hit_short   := false
+    trades_today    += 1
+
+    strategy.entry("LONG", strategy.long, qty=long_qty, comment="ORB_LONG")
+    strategy.exit("L_TP1", "LONG", qty=q_tp1, limit=long_tp1_price, stop=long_sl_price, comment="TP1")
+    if q_tp2 > 0
+        strategy.exit("L_TP2", "LONG", qty=q_tp2, limit=long_tp2_price, stop=long_sl_price, comment="TP2")
+
+    if show_signals
+        label.new(bar_index, low - atr_val,
+             "▲ ORB LONG\nBreak: "  + str.tostring(math.round(orb_high, 0))    +
+             "\nSL: "  + str.tostring(math.round(long_sl_price,   0)) +
+             "\nTP1: " + str.tostring(math.round(long_tp1_price,  0)) +
+             "\nTP2: " + str.tostring(math.round(long_tp2_price,  0)) +
+             "\nQty: " + str.tostring(long_qty),
+             color=col_bull, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    alert('{"action":"buy","symbol":"NQ1!","sl":' + str.tostring(long_sl_price)   +
+          ',"tp1":' + str.tostring(long_tp1_price) +
+          ',"tp2":' + str.tostring(long_tp2_price) +
+          ',"qty":' + str.tostring(long_qty)       +
+          ',"setup":"ORB_LONG"}', alert.freq_once_per_bar)
+
+if short_signal
+    q_tp1 = int(math.max(math.round(short_qty * tp1_pct / 100), 1))
+    q_tp2 = int(math.max(short_qty - q_tp1, 0))
+
+    saved_sl_short  := short_sl_price
+    saved_tp1_short := short_tp1_price
+    saved_tp2_short := short_tp2_price
+    tp1_hit_long    := false
+    tp1_hit_short   := false
+    trades_today    += 1
+
+    strategy.entry("SHORT", strategy.short, qty=short_qty, comment="ORB_SHORT")
+    strategy.exit("S_TP1", "SHORT", qty=q_tp1, limit=short_tp1_price, stop=short_sl_price, comment="TP1")
+    if q_tp2 > 0
+        strategy.exit("S_TP2", "SHORT", qty=q_tp2, limit=short_tp2_price, stop=short_sl_price, comment="TP2")
+
+    if show_signals
+        label.new(bar_index, high + atr_val,
+             "▼ ORB SHORT\nBreak: " + str.tostring(math.round(orb_low, 0))      +
+             "\nSL: "  + str.tostring(math.round(short_sl_price,  0)) +
+             "\nTP1: " + str.tostring(math.round(short_tp1_price, 0)) +
+             "\nTP2: " + str.tostring(math.round(short_tp2_price, 0)) +
+             "\nQty: " + str.tostring(short_qty),
+             color=col_bear, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    alert('{"action":"sell","symbol":"NQ1!","sl":' + str.tostring(short_sl_price)   +
+          ',"tp1":' + str.tostring(short_tp1_price) +
+          ',"tp2":' + str.tostring(short_tp2_price) +
+          ',"qty":' + str.tostring(short_qty)       +
+          ',"setup":"ORB_SHORT"}', alert.freq_once_per_bar)
+
+// ============================================================
+// ── TP1 ERKENNUNG → BREAKEVEN
+// ============================================================
+if strategy.position_size > 0 and not tp1_hit_long and not na(saved_tp1_long)
+    if high >= saved_tp1_long
+        tp1_hit_long := true
+
+if strategy.position_size < 0 and not tp1_hit_short and not na(saved_tp1_short)
+    if low <= saved_tp1_short
+        tp1_hit_short := true
+
+// Breakeven SL für die verbleibende 2. Hälfte
+if use_breakeven and strategy.position_size > 0 and tp1_hit_long and not na(saved_tp2_long)
+    strategy.exit("L_TP2", "LONG", limit=saved_tp2_long, stop=strategy.position_avg_price + 2, comment="TP2_BE")
+
+if use_breakeven and strategy.position_size < 0 and tp1_hit_short and not na(saved_tp2_short)
+    strategy.exit("S_TP2", "SHORT", limit=saved_tp2_short, stop=strategy.position_avg_price - 2, comment="TP2_BE")
+
+// ============================================================
+// ── EOD CLOSE
+// ============================================================
+if use_eod_close and est_mins() >= eod_close_min and strategy.position_size != 0
+    strategy.close_all(comment="EOD_CLOSE")
+
+// ============================================================
+// ── DASHBOARD
+// ============================================================
+var table dash = table.new(position.top_right, 2, 17,
+     border_width=1,
+     border_color=color.new(color.gray, 50),
+     bgcolor=color.new(#0D1117, 10))
+
+if show_dashboard and barstate.islast
+
+    // ── Header
+    table.cell(dash, 0, 0, "ORB + VWAP MOMENTUM PRO v1.0",
+         text_color=color.white, bgcolor=color.new(#1A237E, 20), text_size=size.small)
+    table.cell(dash, 1, 0, "APEX READY 🏆",
+         text_color=color.white, bgcolor=color.new(#1A237E, 20), text_size=size.small)
+
+    // ── ORB Status
+    orb_col = orb_valid ? color.new(#00E676, 30) : in_orb ? color.new(#FFD600, 30) : color.new(color.gray, 50)
+    orb_txt = orb_valid ? "✅ AKTIV" : in_orb ? "⏳ AUFBAU" : "⏸ WARTEN"
+    table.cell(dash, 0, 1, "ORB STATUS",  text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 1, orb_txt,       text_color=color.white, bgcolor=orb_col, text_size=size.small)
+
+    // ── ORB Levels
+    orb_levels_txt = orb_valid ? str.tostring(math.round(orb_high, 0)) + " / " + str.tostring(math.round(orb_low, 0)) : "– / –"
+    table.cell(dash, 0, 2, "ORB HIGH / LOW", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 2, orb_levels_txt,   text_color=col_orb_h,  text_size=size.small)
+
+    // ── Session
+    sess_col = in_session ? color.new(#00E676, 30) : color.new(color.gray, 30)
+    table.cell(dash, 0, 3, "SESSION",                          text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 3, in_session ? "✅ AKTIV" : "⏸ WARTEN", text_color=color.white, bgcolor=sess_col, text_size=size.small)
+
+    // ── VWAP
+    vwap_col = above_vwap ? color.new(#00E676, 30) : color.new(#FF1744, 30)
+    table.cell(dash, 0, 4, "VWAP",
+         text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(math.round(vwap_v, 0)) + (above_vwap ? " ▲" : " ▼"),
+         text_color=color.white, bgcolor=vwap_col, text_size=size.small)
+
+    // ── MACD
+    macd_col = macd_bull ? color.new(#00E676, 30) : macd_bear ? color.new(#FF1744, 30) : color.new(color.gray, 30)
+    macd_txt = macd_bull ? "▲ Bullish" : macd_bear ? "▼ Bearish" : "→ Neutral"
+    table.cell(dash, 0, 5, "MACD",    text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 5, macd_txt,  text_color=color.white, bgcolor=macd_col, text_size=size.small)
+
+    // ── Volume
+    vol_col = vol_spike ? color.new(#00E676, 30) : color.new(color.gray, 30)
+    table.cell(dash, 0, 6, "VOLUME",                              text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 6, vol_spike ? "✅ SPIKE" : "⏸ NORMAL",  text_color=color.white, bgcolor=vol_col, text_size=size.small)
+
+    // ── News
+    news_col = news_blocked ? color.new(#FF1744, 30) : color.new(#00E676, 30)
+    table.cell(dash, 0, 7, "NEWS",                                     text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 7, news_blocked ? "🔴 GESPERRT" : "🟢 FREI",  text_color=color.white, bgcolor=news_col, text_size=size.small)
+
+    // ── Setup Readiness
+    long_setup  = can_trade and above_vwap and macd_bull and vol_spike and orb_valid
+    short_setup = can_trade and below_vwap and macd_bear and vol_spike and orb_valid
+    setup_col = long_setup ? color.new(#00E676, 20) : short_setup ? color.new(#FF1744, 20) : color.new(color.gray, 30)
+    setup_txt = long_setup ? "▲ LONG BEREIT!" : short_setup ? "▼ SHORT BEREIT!" : "– Kein Setup"
+    table.cell(dash, 0, 8, "SETUP",    text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 8, setup_txt,  text_color=color.white, bgcolor=setup_col, text_size=size.small)
+
+    // ── Offene Position
+    pos_col = strategy.position_size != 0 ? color.new(#FFD600, 30) : color.new(color.gray, 30)
+    pos_txt = strategy.position_size > 0  ? "▲ LONG "  + str.tostring(int(strategy.position_size))           :
+              strategy.position_size < 0  ? "▼ SHORT " + str.tostring(int(math.abs(strategy.position_size))) :
+              "– Kein Trade"
+    table.cell(dash, 0, 9, "POSITION", text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 9, pos_txt,    text_color=color.white, bgcolor=pos_col, text_size=size.small)
+
+    // ── TP1 Status
+    tp1_info_col = (tp1_hit_long or tp1_hit_short) ? color.new(#00E676, 30) : color.new(color.gray, 30)
+    tp1_info_txt = (tp1_hit_long or tp1_hit_short) ? "✅ ERREICHT (BE aktiv)" : "⏸ Ausstehend"
+    table.cell(dash, 0, 10, "TP1 STATUS", text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 10, tp1_info_txt, text_color=color.white, bgcolor=tp1_info_col, text_size=size.small)
+
+    // ── Open P&L
+    open_pnl = strategy.openprofit
+    open_col = open_pnl >= 0 ? col_bull : col_bear
+    table.cell(dash, 0, 11, "OPEN P&L",                                   text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 11, "$" + str.tostring(math.round(open_pnl)),     text_color=open_col,   text_size=size.small)
+
+    // ── Trades heute
+    table.cell(dash, 0, 12, "TRADES HEUTE",                                                        text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 12, str.tostring(trades_today) + " / " + str.tostring(max_trades_day),     text_color=color.white, text_size=size.small)
+
+    // ── Entry Status
+    can_col = can_trade ? color.new(#00E676, 20) : color.new(#FF1744, 20)
+    table.cell(dash, 0, 13, "STATUS",                                     text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 13, can_trade ? "✅ ENTRY OK" : "🚫 WARTEN",     text_color=color.white, bgcolor=can_col, text_size=size.small)
+
+    // ── Net P&L
+    pnl_col = strategy.netprofit >= 0 ? col_bull : col_bear
+    table.cell(dash, 0, 14, "NET P&L",                                      text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 14, "$" + str.tostring(math.round(strategy.netprofit)), text_color=pnl_col, text_size=size.small)
+
+    // ── Equity
+    table.cell(dash, 0, 15, "EQUITY",                                          text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 15, "$" + str.tostring(math.round(strategy.equity)),   text_color=color.white, text_size=size.small)
+
+    // ── Apex Daily Loss
+    apex_ok  = daily_pnl > -apex_daily_loss
+    apex_col = apex_ok ? color.new(#00E676, 30) : color.new(#FF1744, 30)
+    apex_txt = apex_ok ? "✅ OK  ($" + str.tostring(math.round(daily_pnl)) + ")" : "🚨 LIMIT ERREICHT!"
+    table.cell(dash, 0, 16, "APEX DAILY",  text_color=color.gray,  text_size=size.small)
+    table.cell(dash, 1, 16, apex_txt,      text_color=color.white, bgcolor=apex_col, text_size=size.small)
+
+// ============================================================
+// ── HINTERGRUNDFARBEN
+// ============================================================
+bgcolor(in_orb                        ? color.new(#FFD600, 95) : na, title="ORB Aufbauphase")
+bgcolor(in_session and not in_orb     ? color.new(#2196F3, 97) : na, title="Trading Session")
